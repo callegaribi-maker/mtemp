@@ -145,11 +145,12 @@ def plotar_resultantes(sinais):
 
 
 def _aplicar_correcao(paciente):
-    """Callback do botao 'Aplicar correcao'. Le os valores ATUAIS dos
-    number_input (via session_state, pelas keys) e recalcula as metricas do
-    paciente -- roda antes do resto do script re-executar, que e o padrao
-    recomendado do Streamlit para garantir que a correcao seja aplicada de
-    fato (em vez de mexer em session_state no meio do laco de renderizacao)."""
+    """Callback do submit do formulario de correcao. Formularios do Streamlit
+    (`st.form`) so disparam um rerun quando o botao de submit e clicado, e
+    nesse rerun TODOS os campos do formulario ja estao com os valores mais
+    recentes digitados pelo usuario (mesmo que ele nao tenha saido do campo) —
+    e o padrao mais robusto para "varios campos + um botao aplicar", evitando
+    qualquer problema de o clique no botao "nao pegar" o valor recem-digitado."""
     info = st.session_state["tug_lote_dados"][paciente]
     sinais = info["sinais"]
 
@@ -196,6 +197,8 @@ with col_d:
 
 if "tug_lote_dados" not in st.session_state:
     st.session_state["tug_lote_dados"] = {}
+if "conferencia_concluida" not in st.session_state:
+    st.session_state["conferencia_concluida"] = False
 
 if arquivos:
     pares = {}
@@ -229,6 +232,7 @@ if arquivos:
                    + ", ".join(sorted(completos.keys())))
 
         if st.button("▶️ Processar todos os pacientes", type="primary"):
+            st.session_state["conferencia_concluida"] = False
             erros = []
             barra = st.progress(0.0)
             for i, (paciente, arqs) in enumerate(sorted(completos.items())):
@@ -270,9 +274,10 @@ if arquivos:
             "Verde/vermelho = início e fim do teste detectados automaticamente na resultante "
             "do giroscópio. Pontos vermelhos = os dois maiores picos dessa resultante (giro "
             "3 m e 6 m). Se algum desses 4 instantes não estiver no lugar certo, digite o "
-            "valor correto (em segundos, lendo no próprio gráfico) e clique em aplicar — as "
-            "métricas do paciente são recalculadas na hora, sem mexer na detecção automática "
-            "das demais variáveis."
+            "valor correto (em segundos, lendo no próprio gráfico) e clique em \"Aplicar "
+            "correção\" — as métricas do paciente são recalculadas na hora, sem mexer na "
+            "detecção automática das demais variáveis. O resultado em bloco só aparece "
+            "depois que você concluir a conferência, no final da página."
         )
         for paciente in sorted(dados_processados.keys()):
             info = dados_processados[paciente]
@@ -291,58 +296,80 @@ if arquivos:
 
                 st.markdown("**Corrigir manualmente (opcional)**")
                 sinais = info["sinais"]
-                cc1, cc2, cc3, cc4 = st.columns(4)
-                with cc1:
-                    st.number_input(
-                        "Início (s)", value=float(sinais["start_test"]),
-                        step=0.05, key=f"start_{paciente}",
+                # st.form: os 4 campos só são "lidos" quando o botão de submit do
+                # PRÓPRIO formulário é clicado, todos juntos, no mesmo instante —
+                # isso evita qualquer situação em que o valor recém-digitado não
+                # seja considerado ao clicar em aplicar.
+                with st.form(key=f"form_correcao_{paciente}"):
+                    cc1, cc2, cc3, cc4 = st.columns(4)
+                    with cc1:
+                        st.number_input(
+                            "Início (s)", value=float(sinais["start_test"]),
+                            step=0.05, key=f"start_{paciente}",
+                        )
+                    with cc2:
+                        st.number_input(
+                            "Fim (s)", value=float(sinais["stop_test"]),
+                            step=0.05, key=f"stop_{paciente}",
+                        )
+                    with cc3:
+                        st.number_input(
+                            "Pico giro 3 m (s)", value=float(sinais["G1_lat"]),
+                            step=0.05, key=f"g1_{paciente}",
+                        )
+                    with cc4:
+                        st.number_input(
+                            "Pico giro 6 m (s)", value=float(sinais["G2_lat"]),
+                            step=0.05, key=f"g2_{paciente}",
+                        )
+                    st.form_submit_button(
+                        "✅ Aplicar correção",
+                        on_click=_aplicar_correcao, args=(paciente,),
                     )
-                with cc2:
-                    st.number_input(
-                        "Fim (s)", value=float(sinais["stop_test"]),
-                        step=0.05, key=f"stop_{paciente}",
-                    )
-                with cc3:
-                    st.number_input(
-                        "Pico giro 3 m (s)", value=float(sinais["G1_lat"]),
-                        step=0.05, key=f"g1_{paciente}",
-                    )
-                with cc4:
-                    st.number_input(
-                        "Pico giro 6 m (s)", value=float(sinais["G2_lat"]),
-                        step=0.05, key=f"g2_{paciente}",
-                    )
-                st.button(
-                    "✅ Aplicar correção", key=f"corrigir_{paciente}",
-                    on_click=_aplicar_correcao, args=(paciente,),
-                )
 
-        st.subheader("4) Resultado em bloco")
-        st.caption("Disponível após conferir/corrigir os pacientes acima, se necessário.")
-        linhas = [
-            _metrics_para_linha(p, v["metrics"], v.get("corrigido", False))
-            for p, v in sorted(dados_processados.items())
-        ]
-        resultado_df = pd.DataFrame(linhas)
-
-        if (resultado_df["Alerta"] != "").any():
+        st.divider()
+        if not dados_processados:
+            pass
+        elif st.session_state.get("conferencia_concluida"):
+            st.success("Conferência concluída — resultado em bloco liberado abaixo.")
+            if st.button("↩️ Voltar a corrigir (esconder resultado em bloco)"):
+                st.session_state["conferencia_concluida"] = False
+                st.rerun()
+        else:
             st.info(
-                "Pacientes marcados com alerta tiveram alguma fase do TUG com duração "
-                "negativa — sinal de que o início/fim ou os picos de giro não foram bem "
-                "identificados automaticamente. Abra o paciente na seção 3 para corrigir."
+                "Confira/corrija os pacientes acima. Quando terminar, clique no "
+                "botão abaixo para liberar o resultado em bloco."
             )
-        st.dataframe(resultado_df, use_container_width=True)
+            if st.button("✅ Concluir conferência e gerar resultado em bloco", type="primary"):
+                st.session_state["conferencia_concluida"] = True
+                st.rerun()
 
-        csv_bytes = resultado_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📄 Baixar resultados em lote (.csv)",
-            data=csv_bytes, file_name="resultados_TUG_lote.csv", mime="text/csv",
-        )
-        txt_bytes = resultado_df.to_csv(index=False, sep="\t").encode("utf-8")
-        st.download_button(
-            "📄 Baixar resultados em lote (.txt, tab-separado)",
-            data=txt_bytes, file_name="resultados_TUG_lote.txt", mime="text/plain",
-        )
+        if dados_processados and st.session_state.get("conferencia_concluida"):
+            st.subheader("4) Resultado em bloco")
+            linhas = [
+                _metrics_para_linha(p, v["metrics"], v.get("corrigido", False))
+                for p, v in sorted(dados_processados.items())
+            ]
+            resultado_df = pd.DataFrame(linhas)
+
+            if (resultado_df["Alerta"] != "").any():
+                st.info(
+                    "Pacientes marcados com alerta tiveram alguma fase do TUG com duração "
+                    "negativa — sinal de que o início/fim ou os picos de giro não foram bem "
+                    "identificados automaticamente. Volte à seção 3 para corrigir."
+                )
+            st.dataframe(resultado_df, use_container_width=True)
+
+            csv_bytes = resultado_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📄 Baixar resultados em lote (.csv)",
+                data=csv_bytes, file_name="resultados_TUG_lote.csv", mime="text/csv",
+            )
+            txt_bytes = resultado_df.to_csv(index=False, sep="\t").encode("utf-8")
+            st.download_button(
+                "📄 Baixar resultados em lote (.txt, tab-separado)",
+                data=txt_bytes, file_name="resultados_TUG_lote.txt", mime="text/plain",
+            )
     else:
         st.info("Clique em \"Processar todos os pacientes\" para calcular os resultados.")
 else:
