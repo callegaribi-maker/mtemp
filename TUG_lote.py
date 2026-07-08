@@ -6,18 +6,27 @@ Este arquivo roda o mesmo processamento de TUG do mWEB.py (via
 `processamento/tugProcessing.py`, sem nenhuma alteracao), mas permite
 processar varios pacientes de uma vez e conferir/corrigir cada um.
 
+Deteccao de inicio/fim e dos picos G1/G2
+-----------------------------------------
+Inicio e fim do teste, e os dois picos de giro (3 m e 6 m), sao detectados
+diretamente no sinal RESULTANTE do giroscopio (o mesmo que aparece no
+grafico): inicio/fim = onde o sinal sobe/desce acima de um limiar adaptativo
+(calculado a partir do ruido de repouso no comeco do registro de cada
+paciente), e G1/G2 = os dois maiores picos da resultante dentro da janela do
+teste. `tugProcessing.processar_tug` continua 100% intocado — essa deteccao
+roda em cima dos sinais ja filtrados que ele devolve (ver
+`processamento/tug_metrics.py`). As demais variaveis (G0/G4/A1/A2/A1v/A2v)
+continuam vindo da deteccao original por eixo, que nao foi reportada como
+incorreta.
+
 Por que existe correcao manual por paciente
 ---------------------------------------------
-O algoritmo original identifica o inicio/fim do teste com um limiar fixo
-dentro de uma janela de "baseline", e os dois picos de giro (3 m e 6 m)
-pegando simplesmente os dois maiores picos da velocidade angular vertical em
-todo o registro -- sem nenhuma restricao de que estejam dentro do teste.
-Isso significa que, se houver algum movimento maior fora da janela do teste
-(ajuste do sensor, etc.), o algoritmo pode marcar o pico errado. No app
-individual isso exigia inspecao visual caso a caso; aqui, cada paciente tem
-campos para corrigir manualmente o inicio, o fim e os dois picos de giro,
-recalculando as metricas derivadas na hora -- sem alterar a deteccao
-automatica em si (`tugProcessing.processar_tug` continua intocado).
+Mesmo com o limiar adaptativo, o ruido de repouso no FINAL do registro pode
+variar de paciente para paciente (por exemplo, se a mao continua se
+ajustando um pouco depois de sentar) e a deteccao automatica pode nao ser
+perfeita em 100% dos casos. Por isso cada paciente tem campos para corrigir
+manualmente o inicio, o fim e os dois picos de giro, recalculando as
+metricas derivadas na hora — sem alterar a deteccao automatica em si.
 """
 
 import io
@@ -135,6 +144,36 @@ def plotar_resultantes(sinais):
         plt.close(fig2)
 
 
+def _aplicar_correcao(paciente):
+    """Callback do botao 'Aplicar correcao'. Le os valores ATUAIS dos
+    number_input (via session_state, pelas keys) e recalcula as metricas do
+    paciente -- roda antes do resto do script re-executar, que e o padrao
+    recomendado do Streamlit para garantir que a correcao seja aplicada de
+    fato (em vez de mexer em session_state no meio do laco de renderizacao)."""
+    info = st.session_state["tug_lote_dados"][paciente]
+    sinais = info["sinais"]
+
+    novo_inicio = st.session_state[f"start_{paciente}"]
+    novo_fim = st.session_state[f"stop_{paciente}"]
+    novo_g1 = st.session_state[f"g1_{paciente}"]
+    novo_g2 = st.session_state[f"g2_{paciente}"]
+
+    sinais_corrigido = dict(sinais)
+    sinais_corrigido["start_test"] = novo_inicio
+    sinais_corrigido["stop_test"] = novo_fim
+    sinais_corrigido["G1_lat"] = novo_g1
+    sinais_corrigido["G2_lat"] = novo_g2
+    sinais_corrigido["G1_amp"] = _y_no_instante(
+        sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g1)
+    sinais_corrigido["G2_amp"] = _y_no_instante(
+        sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g2)
+
+    info["sinais"] = sinais_corrigido
+    info["metrics"] = metricas_a_partir_de_sinais(sinais_corrigido)
+    info["corrigido"] = True
+    st.session_state["_ultima_correcao"] = paciente
+
+
 st.subheader("1) Importar arquivos")
 arquivos = st.file_uploader(
     "Selecione TODOS os arquivos (acelerômetro + giroscópio) de TODOS os pacientes",
@@ -222,7 +261,64 @@ if arquivos:
     }
 
     if dados_processados:
-        st.subheader("3) Resultado em bloco")
+        if st.session_state.get("_ultima_correcao"):
+            st.success(f"Correção aplicada para {st.session_state['_ultima_correcao']}.")
+            st.session_state["_ultima_correcao"] = None
+
+        st.subheader("3) Conferir e corrigir cada paciente")
+        st.caption(
+            "Verde/vermelho = início e fim do teste detectados automaticamente na resultante "
+            "do giroscópio. Pontos vermelhos = os dois maiores picos dessa resultante (giro "
+            "3 m e 6 m). Se algum desses 4 instantes não estiver no lugar certo, digite o "
+            "valor correto (em segundos, lendo no próprio gráfico) e clique em aplicar — as "
+            "métricas do paciente são recalculadas na hora, sem mexer na detecção automática "
+            "das demais variáveis."
+        )
+        for paciente in sorted(dados_processados.keys()):
+            info = dados_processados[paciente]
+            metrics = info["metrics"]
+            fases = [
+                metrics["Duracao para levantar (s)"],
+                metrics["Duracao da caminhada de ida (s)"],
+                metrics["Duracao da caminhada de volta (s)"],
+                metrics["Duracao para sentar (s)"],
+            ]
+            alerta_paciente = any(f < 0 for f in fases)
+            titulo = f"👤 {paciente}" + (" ⚠️" if alerta_paciente else "") + \
+                     (" ✅ corrigido" if info.get("corrigido") else "")
+            with st.expander(titulo):
+                plotar_resultantes(info["sinais"])
+
+                st.markdown("**Corrigir manualmente (opcional)**")
+                sinais = info["sinais"]
+                cc1, cc2, cc3, cc4 = st.columns(4)
+                with cc1:
+                    st.number_input(
+                        "Início (s)", value=float(sinais["start_test"]),
+                        step=0.05, key=f"start_{paciente}",
+                    )
+                with cc2:
+                    st.number_input(
+                        "Fim (s)", value=float(sinais["stop_test"]),
+                        step=0.05, key=f"stop_{paciente}",
+                    )
+                with cc3:
+                    st.number_input(
+                        "Pico giro 3 m (s)", value=float(sinais["G1_lat"]),
+                        step=0.05, key=f"g1_{paciente}",
+                    )
+                with cc4:
+                    st.number_input(
+                        "Pico giro 6 m (s)", value=float(sinais["G2_lat"]),
+                        step=0.05, key=f"g2_{paciente}",
+                    )
+                st.button(
+                    "✅ Aplicar correção", key=f"corrigir_{paciente}",
+                    on_click=_aplicar_correcao, args=(paciente,),
+                )
+
+        st.subheader("4) Resultado em bloco")
+        st.caption("Disponível após conferir/corrigir os pacientes acima, se necessário.")
         linhas = [
             _metrics_para_linha(p, v["metrics"], v.get("corrigido", False))
             for p, v in sorted(dados_processados.items())
@@ -233,7 +329,7 @@ if arquivos:
             st.info(
                 "Pacientes marcados com alerta tiveram alguma fase do TUG com duração "
                 "negativa — sinal de que o início/fim ou os picos de giro não foram bem "
-                "identificados automaticamente. Abra o paciente na seção 4 para corrigir."
+                "identificados automaticamente. Abra o paciente na seção 3 para corrigir."
             )
         st.dataframe(resultado_df, use_container_width=True)
 
@@ -247,60 +343,6 @@ if arquivos:
             "📄 Baixar resultados em lote (.txt, tab-separado)",
             data=txt_bytes, file_name="resultados_TUG_lote.txt", mime="text/plain",
         )
-
-        st.subheader("4) Conferir e corrigir cada paciente")
-        st.caption(
-            "Verde/vermelho = início e fim do teste detectados automaticamente. Pontos "
-            "vermelhos = os dois picos de giro (3 m e 6 m). Se algum desses 4 instantes "
-            "não estiver no lugar certo, digite o valor correto (em segundos, lendo no "
-            "próprio gráfico) e clique em aplicar — as métricas do paciente são "
-            "recalculadas na hora, sem mexer na detecção automática dos outros pontos."
-        )
-        for paciente in sorted(dados_processados.keys()):
-            info = dados_processados[paciente]
-            alerta_paciente = resultado_df.loc[resultado_df["Paciente"] == paciente, "Alerta"].iloc[0]
-            titulo = f"👤 {paciente}" + (" ⚠️" if alerta_paciente else "")
-            with st.expander(titulo):
-                plotar_resultantes(info["sinais"])
-
-                st.markdown("**Corrigir manualmente (opcional)**")
-                sinais = info["sinais"]
-                cc1, cc2, cc3, cc4 = st.columns(4)
-                with cc1:
-                    novo_inicio = st.number_input(
-                        "Início (s)", value=float(sinais["start_test"]),
-                        step=0.05, key=f"start_{paciente}",
-                    )
-                with cc2:
-                    novo_fim = st.number_input(
-                        "Fim (s)", value=float(sinais["stop_test"]),
-                        step=0.05, key=f"stop_{paciente}",
-                    )
-                with cc3:
-                    novo_g1 = st.number_input(
-                        "Pico giro 3 m (s)", value=float(sinais["G1_lat"]),
-                        step=0.05, key=f"g1_{paciente}",
-                    )
-                with cc4:
-                    novo_g2 = st.number_input(
-                        "Pico giro 6 m (s)", value=float(sinais["G2_lat"]),
-                        step=0.05, key=f"g2_{paciente}",
-                    )
-                if st.button("✅ Aplicar correção", key=f"corrigir_{paciente}"):
-                    sinais_corrigido = dict(sinais)
-                    sinais_corrigido["start_test"] = novo_inicio
-                    sinais_corrigido["stop_test"] = novo_fim
-                    sinais_corrigido["G1_lat"] = novo_g1
-                    sinais_corrigido["G2_lat"] = novo_g2
-                    sinais_corrigido["G1_amp"] = _y_no_instante(
-                        sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g1)
-                    sinais_corrigido["G2_amp"] = _y_no_instante(
-                        sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g2)
-
-                    info["sinais"] = sinais_corrigido
-                    info["metrics"] = metricas_a_partir_de_sinais(sinais_corrigido)
-                    info["corrigido"] = True
-                    st.rerun()
     else:
         st.info("Clique em \"Processar todos os pacientes\" para calcular os resultados.")
 else:
