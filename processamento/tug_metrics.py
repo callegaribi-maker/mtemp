@@ -22,17 +22,29 @@ from scipy.signal import find_peaks
 from processamento import tugProcessing
 
 
+def _limiar_repouso(janela, k):
+    """Media + k*desvio-padrao de uma janela de repouso, com piso minimo para
+    evitar limiares quase iguais a zero quando o desvio-padrao e muito
+    pequeno."""
+    thr = janela.mean() + k * janela.std()
+    return max(thr, janela.mean() * 1.15, 0.05)
+
+
 def detectar_inicio_fim_resultante(t, y, baseline_onset, baseline_offset, k=4.0):
     """Detecta inicio/fim do teste diretamente no sinal RESULTANTE do giroscopio
-    (norma_gyro_filtrado): "o inicio e fim e quando o sinal sobe/desce".
+    (norma_gyro_filtrado): "o inicio e fim e quando o sinal sobe/desce" -- e o
+    fim e detectado do MESMO JEITO que o inicio, só que de tras para frente:
+    inicio = varre PARA FRENTE a partir do começo, procurando a primeira vez
+    que o sinal cruza o limiar de repouso do COMEÇO do registro; fim = varre
+    PARA TRAS a partir do fim, procurando a ultima vez que o sinal esta acima
+    do limiar de repouso do FINAL do registro.
 
-    O limiar e adaptativo: media + k*desvio-padrao de uma janela de repouso no
-    comeco do registro (antes do baseline_onset) -- evita depender de um valor
-    fixo (0.25 rad/s) que pode ficar perto demais do ruido de repouso da
-    resultante em alguns pacientes. O inicio e a primeira vez que o sinal cruza
-    esse limiar depois do baseline_onset; o fim e a ULTIMA vez que o sinal esta
-    acima do limiar antes do baseline_offset (mesma janela/convencao do
-    algoritmo original, que tambem limita a busca do fim ate o baseline_offset)."""
+    Os dois limiares sao calculados separadamente (nao é o mesmo valor reusado
+    dos dois lados) porque o ruido de repouso no final do registro (com o
+    aparelho ainda na mao, por exemplo) pode ser bem mais alto que no começo
+    (aparelho parado antes do paciente pegá-lo) -- usar só o limiar do começo
+    para o fim faz a deteccao "atrasar" o fim ou, ao contrario, gruda-lo perto
+    demais do limite da margem final."""
     t = np.asarray(t)
     y = np.asarray(y)
 
@@ -40,24 +52,30 @@ def detectar_inicio_fim_resultante(t, y, baseline_onset, baseline_offset, k=4.0)
     offset_idx = int(np.searchsorted(t, baseline_offset))
     offset_idx = max(offset_idx, onset_idx + 1)
 
-    janela_repouso = y[t <= max(baseline_onset, t[0] + 1.5)]
-    if len(janela_repouso) < 5:
-        janela_repouso = y[:max(5, len(y) // 20)]
-    thr = janela_repouso.mean() + k * janela_repouso.std()
-    thr = max(thr, janela_repouso.mean() * 1.15, 0.05)
+    janela_inicio = y[t <= max(baseline_onset, t[0] + 1.5)]
+    if len(janela_inicio) < 5:
+        janela_inicio = y[:max(5, len(y) // 20)]
+    thr_inicio = _limiar_repouso(janela_inicio, k)
+
+    janela_fim = y[t >= baseline_offset]
+    if len(janela_fim) < 5:
+        janela_fim = y[t >= t[-1] - 1.5]
+    if len(janela_fim) < 5:
+        janela_fim = y[-max(5, len(y) // 20):]
+    thr_fim = _limiar_repouso(janela_fim, k)
 
     seg_inicio = y[onset_idx:]
-    acima_inicio = np.where(seg_inicio > thr)[0]
+    acima_inicio = np.where(seg_inicio > thr_inicio)[0]
     start_idx = onset_idx + acima_inicio[0] if len(acima_inicio) else onset_idx
 
     seg_fim = y[:offset_idx]
-    acima_fim = np.where(seg_fim > thr)[0]
+    acima_fim = np.where(seg_fim > thr_fim)[0]
     stop_idx = acima_fim[-1] if len(acima_fim) else max(offset_idx - 1, start_idx + 1)
 
     if stop_idx <= start_idx:
         stop_idx = min(len(y) - 1, start_idx + 1)
 
-    return float(t[start_idx]), float(t[stop_idx]), float(thr)
+    return float(t[start_idx]), float(t[stop_idx]), float(thr_inicio), float(thr_fim)
 
 
 def detectar_dois_maiores_picos(t, y, tmin, tmax):
@@ -158,7 +176,7 @@ def processar_paciente_tug(dados_acc, dados_gyro, baseline_onset, baseline_offse
         dados_acc, dados_gyro, filtro_acc, filtro_gyro, baseline_onset, baseline_offset
     )
 
-    start_test, stop_test, _thr_gyro = detectar_inicio_fim_resultante(
+    start_test, stop_test, _thr_inicio, _thr_fim = detectar_inicio_fim_resultante(
         t_novo_gyro, norma_gyro_filtrado, baseline_onset, baseline_offset
     )
     G1_lat, G1_amp, G2_lat, G2_amp = detectar_dois_maiores_picos(
