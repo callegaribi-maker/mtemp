@@ -6,27 +6,30 @@ Este arquivo roda o mesmo processamento de TUG do mWEB.py (via
 `processamento/tugProcessing.py`, sem nenhuma alteracao), mas permite
 processar varios pacientes de uma vez e conferir/corrigir cada um.
 
-Deteccao de inicio/fim e dos picos G1/G2
------------------------------------------
-Inicio e fim do teste, e os dois picos de giro (3 m e 6 m), sao detectados
-diretamente no sinal RESULTANTE do giroscopio (o mesmo que aparece no
-grafico): inicio/fim = onde o sinal sobe/desce acima de um limiar adaptativo
-(calculado a partir do ruido de repouso no comeco do registro de cada
-paciente), e G1/G2 = os dois maiores picos da resultante dentro da janela do
-teste. `tugProcessing.processar_tug` continua 100% intocado — essa deteccao
-roda em cima dos sinais ja filtrados que ele devolve (ver
-`processamento/tug_metrics.py`). As demais variaveis (G0/G4/A1/A2/A1v/A2v)
-continuam vindo da deteccao original por eixo, que nao foi reportada como
-incorreta.
+Deteccao 100% a partir das curvas RESULTANTES
+------------------------------------------------
+Todos os marcos do teste sao detectados diretamente nos sinais RESULTANTES
+(norma) ja filtrados por `tugProcessing.processar_tug` — os mesmos que
+aparecem nos graficos:
+  - Inicio/fim do teste: onde a resultante do giroscopio sobe/desce acima de
+    um limiar adaptativo (calculado a partir do ruido de repouso no comeco
+    do registro de cada paciente).
+  - G0 (pico sentado→pé): maior pico local da resultante do giroscopio entre
+    o inicio e o giro de 3 m.
+  - G1/G2 (os dois giros): os dois maiores picos da resultante do giroscopio
+    dentro da janela do teste.
+  - Picos de aceleração (sentado→pé e pé→sentado): maior valor da resultante
+    do acelerômetro dentro da janela de cada transição.
+`tugProcessing.processar_tug` continua 100% intocado — essa deteccao roda em
+cima dos sinais ja filtrados que ele devolve (ver `processamento/tug_metrics.py`).
 
 Por que existe correcao manual por paciente
 ---------------------------------------------
 Mesmo com o limiar adaptativo, o ruido de repouso no FINAL do registro pode
-variar de paciente para paciente (por exemplo, se a mao continua se
-ajustando um pouco depois de sentar) e a deteccao automatica pode nao ser
+variar de paciente para paciente e a deteccao automatica pode não ser
 perfeita em 100% dos casos. Por isso cada paciente tem campos para corrigir
-manualmente o inicio, o fim e os dois picos de giro, recalculando as
-metricas derivadas na hora — sem alterar a deteccao automatica em si.
+manualmente início, G0, G1, G2 e fim — os picos de aceleração são
+recalculados automaticamente a partir das novas janelas.
 """
 
 import io
@@ -34,10 +37,14 @@ import re
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import streamlit as st
 
-from processamento.tug_metrics import processar_paciente_tug, metricas_a_partir_de_sinais
+from processamento.tug_metrics import (
+    processar_paciente_tug,
+    metricas_a_partir_de_sinais,
+    recalcular_picos_acc,
+)
 
 st.set_page_config(page_title="TUG em lote - Momentum Web", page_icon="🧍", layout="wide")
 
@@ -91,22 +98,22 @@ def identificar_paciente(nome_arquivo: str):
 
 def _y_no_instante(t_array, y_array, t_alvo):
     idx = int(np.argmin(np.abs(np.asarray(t_array) - t_alvo)))
-    return y_array[idx]
+    return float(y_array[idx])
 
 
 def _metrics_para_linha(paciente, metrics, corrigido):
     fases = [
-        metrics["Duracao para levantar (s)"],
-        metrics["Duracao da caminhada de ida (s)"],
-        metrics["Duracao da caminhada de volta (s)"],
-        metrics["Duracao para sentar (s)"],
+        metrics["Sit-to-Stand transition duration (s)"],
+        metrics["Forward walking duration (s)"],
+        metrics["Return walking duration (s)"],
+        metrics["Stand-to-Sit transition duration (s)"],
     ]
     alerta = "Revisar (fase com duração negativa)" if any(f < 0 for f in fases) else ""
     return {"Paciente": paciente, **metrics, "Corrigido manualmente": "Sim" if corrigido else "",
             "Alerta": alerta}
 
 
-def plotar_resultantes(sinais):
+def plotar_resultantes(sinais, paciente):
     t_acc = sinais["t_novo_acc"]
     norma_acc = sinais["norma_acc_filtrado"]
     t_gyro = sinais["t_novo_gyro"]
@@ -116,32 +123,61 @@ def plotar_resultantes(sinais):
 
     col1, col2 = st.columns(2)
     with col1:
-        fig1, ax1 = plt.subplots(figsize=(6, 3.2))
-        ax1.plot(t_acc, norma_acc, linewidth=0.8, color="black")
-        ax1.axvline(start_test, color="green", linestyle="--", label="Início", linewidth=0.9)
-        ax1.axvline(stop_test, color="red", linestyle="--", label="Final", linewidth=0.9)
-        ax1.set_xlabel("Tempo (s)")
-        ax1.set_ylabel("Aceleração resultante (m/s²)")
-        ax1.legend(fontsize=8)
-        fig1.tight_layout()
-        st.pyplot(fig1)
-        plt.close(fig1)
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(
+            x=t_acc, y=norma_acc, mode="lines", name="Aceleração resultante",
+            line=dict(color="black", width=1),
+            hovertemplate="t=%{x:.2f}s<br>%{y:.2f} m/s²<extra></extra>",
+        ))
+        fig1.add_vline(x=start_test, line=dict(color="green", dash="dash", width=1.5))
+        fig1.add_vline(x=stop_test, line=dict(color="red", dash="dash", width=1.5))
+        fig1.add_trace(go.Scatter(
+            x=[sinais["A1_lat"]], y=[sinais["A1_amp"]], mode="markers",
+            marker=dict(color="green", size=11), name="A1 (sentado→pé)",
+            hovertemplate="A1: t=%{x:.2f}s<br>%{y:.2f} m/s²<extra></extra>",
+        ))
+        fig1.add_trace(go.Scatter(
+            x=[sinais["A2_lat"]], y=[sinais["A2_amp"]], mode="markers",
+            marker=dict(color="magenta", size=11), name="A2 (pé→sentado)",
+            hovertemplate="A2: t=%{x:.2f}s<br>%{y:.2f} m/s²<extra></extra>",
+        ))
+        fig1.update_layout(
+            height=340, margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="Tempo (s)", yaxis_title="Aceleração resultante (m/s²)",
+            hovermode="x unified", legend=dict(orientation="h", y=1.15),
+        )
+        st.plotly_chart(fig1, use_container_width=True, key=f"plot_acc_{paciente}")
 
     with col2:
-        fig2, ax2 = plt.subplots(figsize=(6, 3.2))
-        ax2.plot(t_gyro, norma_gyro, linewidth=0.8, color="black")
-        ax2.axvline(start_test, color="green", linestyle="--", label="Início", linewidth=0.9)
-        ax2.axvline(stop_test, color="red", linestyle="--", label="Final", linewidth=0.9)
-        y_g1 = _y_no_instante(t_gyro, norma_gyro, sinais["G1_lat"])
-        y_g2 = _y_no_instante(t_gyro, norma_gyro, sinais["G2_lat"])
-        ax2.plot(sinais["G1_lat"], y_g1, "ro", label="Giro 3 m")
-        ax2.plot(sinais["G2_lat"], y_g2, "ro", label="Giro 6 m")
-        ax2.set_xlabel("Tempo (s)")
-        ax2.set_ylabel("Vel. angular resultante (rad/s)")
-        ax2.legend(fontsize=8)
-        fig2.tight_layout()
-        st.pyplot(fig2)
-        plt.close(fig2)
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=t_gyro, y=norma_gyro, mode="lines", name="Vel. angular resultante",
+            line=dict(color="black", width=1),
+            hovertemplate="t=%{x:.2f}s<br>%{y:.2f} rad/s<extra></extra>",
+        ))
+        fig2.add_vline(x=start_test, line=dict(color="green", dash="dash", width=1.5))
+        fig2.add_vline(x=stop_test, line=dict(color="red", dash="dash", width=1.5))
+        fig2.add_trace(go.Scatter(
+            x=[sinais["G0_lat"]], y=[sinais["G0_amp"]], mode="markers",
+            marker=dict(color="seagreen", size=11), name="G0 (sentado→pé)",
+            hovertemplate="G0: t=%{x:.2f}s<br>%{y:.2f} rad/s<extra></extra>",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=[sinais["G1_lat"]], y=[sinais["G1_amp"]], mode="markers",
+            marker=dict(color="royalblue", size=11), name="G1 (giro 3 m)",
+            hovertemplate="G1: t=%{x:.2f}s<br>%{y:.2f} rad/s<extra></extra>",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=[sinais["G2_lat"]], y=[sinais["G2_amp"]], mode="markers",
+            marker=dict(color="magenta", size=11), name="G2 (giro na cadeira)",
+            hovertemplate="G2: t=%{x:.2f}s<br>%{y:.2f} rad/s<extra></extra>",
+        ))
+        fig2.update_layout(
+            height=340, margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="Tempo (s)", yaxis_title="Vel. angular resultante (rad/s)",
+            hovermode="x unified", legend=dict(orientation="h", y=1.15),
+        )
+        st.plotly_chart(fig2, use_container_width=True, key=f"plot_gyro_{paciente}")
 
 
 def _aplicar_correcao(paciente):
@@ -155,19 +191,27 @@ def _aplicar_correcao(paciente):
     sinais = info["sinais"]
 
     novo_inicio = st.session_state[f"start_{paciente}"]
-    novo_fim = st.session_state[f"stop_{paciente}"]
+    novo_g0 = st.session_state[f"g0_{paciente}"]
     novo_g1 = st.session_state[f"g1_{paciente}"]
     novo_g2 = st.session_state[f"g2_{paciente}"]
+    novo_fim = st.session_state[f"stop_{paciente}"]
 
     sinais_corrigido = dict(sinais)
     sinais_corrigido["start_test"] = novo_inicio
     sinais_corrigido["stop_test"] = novo_fim
+    sinais_corrigido["G0_lat"] = novo_g0
     sinais_corrigido["G1_lat"] = novo_g1
     sinais_corrigido["G2_lat"] = novo_g2
+    sinais_corrigido["G0_amp"] = _y_no_instante(
+        sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g0)
     sinais_corrigido["G1_amp"] = _y_no_instante(
         sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g1)
     sinais_corrigido["G2_amp"] = _y_no_instante(
         sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g2)
+    # Os picos de aceleração (A1/A2) são o maior valor dentro das janelas
+    # [início, G0] e [G2, fim] — como essas janelas podem ter mudado, eles
+    # são recalculados aqui em vez de manter o valor antigo.
+    sinais_corrigido = recalcular_picos_acc(sinais_corrigido)
 
     info["sinais"] = sinais_corrigido
     info["metrics"] = metricas_a_partir_de_sinais(sinais_corrigido)
@@ -271,37 +315,38 @@ if arquivos:
 
         st.subheader("3) Conferir e corrigir cada paciente")
         st.caption(
-            "Verde/vermelho = início e fim do teste detectados automaticamente na resultante "
-            "do giroscópio. Pontos vermelhos = os dois maiores picos dessa resultante (giro "
-            "3 m e 6 m). Se algum desses 4 instantes não estiver no lugar certo, digite o "
-            "valor correto (em segundos, lendo no próprio gráfico) e clique em \"Aplicar "
-            "correção\" — as métricas do paciente são recalculadas na hora, sem mexer na "
-            "detecção automática das demais variáveis. O resultado em bloco só aparece "
-            "depois que você concluir a conferência, no final da página."
+            "Passe o mouse sobre os gráficos para ver o tempo (eixo x) e o valor exato em "
+            "cada ponto. Verde/vermelho = início e fim do teste. Os pontos marcados são G0 "
+            "(sentado→pé), G1 (giro de 3 m), G2 (giro na frente da cadeira) no gráfico do "
+            "giroscópio, e A1/A2 (picos de aceleração) no gráfico do acelerômetro. Se algum "
+            "instante não estiver no lugar certo, digite o valor correto (em segundos) e "
+            "clique em \"Aplicar correção\" — as métricas do paciente são recalculadas na "
+            "hora, sem mexer na detecção automática dos demais pacientes. O resultado em "
+            "bloco só aparece depois que você concluir a conferência, no final da página."
         )
         for paciente in sorted(dados_processados.keys()):
             info = dados_processados[paciente]
             metrics = info["metrics"]
             fases = [
-                metrics["Duracao para levantar (s)"],
-                metrics["Duracao da caminhada de ida (s)"],
-                metrics["Duracao da caminhada de volta (s)"],
-                metrics["Duracao para sentar (s)"],
+                metrics["Sit-to-Stand transition duration (s)"],
+                metrics["Forward walking duration (s)"],
+                metrics["Return walking duration (s)"],
+                metrics["Stand-to-Sit transition duration (s)"],
             ]
             alerta_paciente = any(f < 0 for f in fases)
             titulo = f"👤 {paciente}" + (" ⚠️" if alerta_paciente else "") + \
                      (" ✅ corrigido" if info.get("corrigido") else "")
             with st.expander(titulo):
-                plotar_resultantes(info["sinais"])
+                plotar_resultantes(info["sinais"], paciente)
 
                 st.markdown("**Corrigir manualmente (opcional)**")
                 sinais = info["sinais"]
-                # st.form: os 4 campos só são "lidos" quando o botão de submit do
+                # st.form: os campos só são "lidos" quando o botão de submit do
                 # PRÓPRIO formulário é clicado, todos juntos, no mesmo instante —
                 # isso evita qualquer situação em que o valor recém-digitado não
                 # seja considerado ao clicar em aplicar.
                 with st.form(key=f"form_correcao_{paciente}"):
-                    cc1, cc2, cc3, cc4 = st.columns(4)
+                    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
                     with cc1:
                         st.number_input(
                             "Início (s)", value=float(sinais["start_test"]),
@@ -309,18 +354,23 @@ if arquivos:
                         )
                     with cc2:
                         st.number_input(
-                            "Fim (s)", value=float(sinais["stop_test"]),
-                            step=0.05, key=f"stop_{paciente}",
+                            "G0 sentado→pé (s)", value=float(sinais["G0_lat"]),
+                            step=0.05, key=f"g0_{paciente}",
                         )
                     with cc3:
                         st.number_input(
-                            "Pico giro 3 m (s)", value=float(sinais["G1_lat"]),
+                            "G1 giro 3 m (s)", value=float(sinais["G1_lat"]),
                             step=0.05, key=f"g1_{paciente}",
                         )
                     with cc4:
                         st.number_input(
-                            "Pico giro 6 m (s)", value=float(sinais["G2_lat"]),
+                            "G2 giro cadeira (s)", value=float(sinais["G2_lat"]),
                             step=0.05, key=f"g2_{paciente}",
+                        )
+                    with cc5:
+                        st.number_input(
+                            "Fim (s)", value=float(sinais["stop_test"]),
+                            step=0.05, key=f"stop_{paciente}",
                         )
                     st.form_submit_button(
                         "✅ Aplicar correção",
@@ -355,8 +405,8 @@ if arquivos:
             if (resultado_df["Alerta"] != "").any():
                 st.info(
                     "Pacientes marcados com alerta tiveram alguma fase do TUG com duração "
-                    "negativa — sinal de que o início/fim ou os picos de giro não foram bem "
-                    "identificados automaticamente. Volte à seção 3 para corrigir."
+                    "negativa — sinal de que algum dos marcos não foi bem identificado "
+                    "automaticamente. Volte à seção 3 para corrigir."
                 )
             st.dataframe(resultado_df, use_container_width=True)
 
