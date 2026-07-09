@@ -14,12 +14,13 @@ aparecem nos graficos:
   - Inicio/fim do teste: onde a resultante do giroscopio sobe/desce acima de
     um limiar adaptativo (calculado a partir do ruido de repouso no comeco
     do registro de cada paciente).
-  - G0 (pico sentado→pé): maior pico local da resultante do giroscopio entre
-    o inicio e o giro de 3 m.
   - G1/G2 (os dois giros): os dois maiores picos da resultante do giroscopio
     dentro da janela do teste.
-  - Picos de aceleração (sentado→pé e pé→sentado): maior valor da resultante
-    do acelerômetro dentro da janela de cada transição.
+  - A1 (pico de aceleração sentado→pé): maior valor da resultante do
+    acelerômetro entre o início e G1 — é o próprio "empurrão" para levantar,
+    e marca a fronteira entre a fase sentado→pé e a caminhada de ida.
+  - A2 (pico de aceleração pé→sentado): maior valor da resultante do
+    acelerômetro entre G2 e o fim do teste.
 `tugProcessing.processar_tug` continua 100% intocado — essa deteccao roda em
 cima dos sinais ja filtrados que ele devolve (ver `processamento/tug_metrics.py`).
 
@@ -28,7 +29,7 @@ Por que existe correcao manual por paciente
 Mesmo com o limiar adaptativo, o ruido de repouso no FINAL do registro pode
 variar de paciente para paciente e a deteccao automatica pode não ser
 perfeita em 100% dos casos. Por isso cada paciente tem campos para corrigir
-manualmente início, G0, G1, G2 e fim — os picos de aceleração são
+manualmente início, G1, G2 e fim — os picos de aceleração (A1/A2) são
 recalculados automaticamente a partir das novas janelas.
 """
 
@@ -158,11 +159,6 @@ def plotar_resultantes(sinais, paciente):
         fig2.add_vline(x=start_test, line=dict(color="green", dash="dash", width=1.5))
         fig2.add_vline(x=stop_test, line=dict(color="red", dash="dash", width=1.5))
         fig2.add_trace(go.Scatter(
-            x=[sinais["G0_lat"]], y=[sinais["G0_amp"]], mode="markers",
-            marker=dict(color="seagreen", size=11), name="G0 (sentado→pé)",
-            hovertemplate="G0: t=%{x:.2f}s<br>%{y:.2f} rad/s<extra></extra>",
-        ))
-        fig2.add_trace(go.Scatter(
             x=[sinais["G1_lat"]], y=[sinais["G1_amp"]], mode="markers",
             marker=dict(color="royalblue", size=11), name="G1 (giro 3 m)",
             hovertemplate="G1: t=%{x:.2f}s<br>%{y:.2f} rad/s<extra></extra>",
@@ -191,7 +187,6 @@ def _aplicar_correcao(paciente):
     sinais = info["sinais"]
 
     novo_inicio = st.session_state[f"start_{paciente}"]
-    novo_g0 = st.session_state[f"g0_{paciente}"]
     novo_g1 = st.session_state[f"g1_{paciente}"]
     novo_g2 = st.session_state[f"g2_{paciente}"]
     novo_fim = st.session_state[f"stop_{paciente}"]
@@ -199,17 +194,14 @@ def _aplicar_correcao(paciente):
     sinais_corrigido = dict(sinais)
     sinais_corrigido["start_test"] = novo_inicio
     sinais_corrigido["stop_test"] = novo_fim
-    sinais_corrigido["G0_lat"] = novo_g0
     sinais_corrigido["G1_lat"] = novo_g1
     sinais_corrigido["G2_lat"] = novo_g2
-    sinais_corrigido["G0_amp"] = _y_no_instante(
-        sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g0)
     sinais_corrigido["G1_amp"] = _y_no_instante(
         sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g1)
     sinais_corrigido["G2_amp"] = _y_no_instante(
         sinais["t_novo_gyro"], sinais["norma_gyro_filtrado"], novo_g2)
     # Os picos de aceleração (A1/A2) são o maior valor dentro das janelas
-    # [início, G0] e [G2, fim] — como essas janelas podem ter mudado, eles
+    # [início, G1] e [G2, fim] — como essas janelas podem ter mudado, eles
     # são recalculados aqui em vez de manter o valor antigo.
     sinais_corrigido = recalcular_picos_acc(sinais_corrigido)
 
@@ -316,13 +308,14 @@ if arquivos:
         st.subheader("3) Conferir e corrigir cada paciente")
         st.caption(
             "Passe o mouse sobre os gráficos para ver o tempo (eixo x) e o valor exato em "
-            "cada ponto. Verde/vermelho = início e fim do teste. Os pontos marcados são G0 "
-            "(sentado→pé), G1 (giro de 3 m), G2 (giro na frente da cadeira) no gráfico do "
-            "giroscópio, e A1/A2 (picos de aceleração) no gráfico do acelerômetro. Se algum "
-            "instante não estiver no lugar certo, digite o valor correto (em segundos) e "
-            "clique em \"Aplicar correção\" — as métricas do paciente são recalculadas na "
-            "hora, sem mexer na detecção automática dos demais pacientes. O resultado em "
-            "bloco só aparece depois que você concluir a conferência, no final da página."
+            "cada ponto. Verde/vermelho = início e fim do teste. Os pontos marcados são G1 "
+            "(giro de 3 m) e G2 (giro na frente da cadeira) no gráfico do giroscópio, e "
+            "A1/A2 (picos de aceleração sentado→pé e pé→sentado) no gráfico do acelerômetro. "
+            "Se algum instante não estiver no lugar certo, digite o valor correto (em "
+            "segundos) e clique em \"Aplicar correção\" — as métricas do paciente são "
+            "recalculadas na hora, sem mexer na detecção automática dos demais pacientes. O "
+            "resultado em bloco só aparece depois que você concluir a conferência, no final "
+            "da página."
         )
         for paciente in sorted(dados_processados.keys()):
             info = dados_processados[paciente]
@@ -346,7 +339,7 @@ if arquivos:
                 # isso evita qualquer situação em que o valor recém-digitado não
                 # seja considerado ao clicar em aplicar.
                 with st.form(key=f"form_correcao_{paciente}"):
-                    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+                    cc1, cc2, cc3, cc4 = st.columns(4)
                     with cc1:
                         st.number_input(
                             "Início (s)", value=float(sinais["start_test"]),
@@ -354,20 +347,15 @@ if arquivos:
                         )
                     with cc2:
                         st.number_input(
-                            "G0 sentado→pé (s)", value=float(sinais["G0_lat"]),
-                            step=0.05, key=f"g0_{paciente}",
-                        )
-                    with cc3:
-                        st.number_input(
                             "G1 giro 3 m (s)", value=float(sinais["G1_lat"]),
                             step=0.05, key=f"g1_{paciente}",
                         )
-                    with cc4:
+                    with cc3:
                         st.number_input(
                             "G2 giro cadeira (s)", value=float(sinais["G2_lat"]),
                             step=0.05, key=f"g2_{paciente}",
                         )
-                    with cc5:
+                    with cc4:
                         st.number_input(
                             "Fim (s)", value=float(sinais["stop_test"]),
                             step=0.05, key=f"stop_{paciente}",
