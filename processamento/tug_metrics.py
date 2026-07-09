@@ -5,9 +5,9 @@ Camada fina sobre `processamento.tugProcessing.processar_tug` (codigo original,
 nao modificado) que reaproveita os sinais RESULTANTES (norma) ja filtrados por
 ele -- resultante do acelerometro (norma_acc_filtrado) e do giroscopio
 (norma_gyro_filtrado) -- para detectar todos os marcos do TUG (inicio, fim,
-pico sentado->pe, os dois picos de giro dos giros e os dois picos de
-aceleracao das transicoes), em vez de usar eixos isolados escolhidos por uma
-heuristica de orientacao do aparelho.
+os dois picos de giro e os dois picos de aceleracao das transicoes), em vez
+de usar eixos isolados escolhidos por uma heuristica de orientacao do
+aparelho.
 
 `tugProcessing.processar_tug` continua 100% intocado. `metricas_a_partir_de_sinais`
 recalcula as metricas (nomes/ordem iguais aos de uma tabela de referencia
@@ -87,37 +87,10 @@ def detectar_dois_maiores_picos(t, y, tmin, tmax):
     return float(t[idx_1]), float(y[idx_1]), float(t[idx_2]), float(y[idx_2])
 
 
-def detectar_maior_pico_local(t, y, tmin, tmax):
-    """Encontra o maior PICO LOCAL (maximo local de verdade, via find_peaks --
-    nao apenas o maior valor bruto da janela, que poderia "roubar" o valor
-    logo na borda da janela) dentro de [tmin, tmax]. Usado para achar o pico
-    de giro sentado->pe (G0), que costuma ser bem menor que os picos dos
-    giros (G1/G2) mas ainda assim um maximo local genuino logo apos o inicio
-    do teste."""
-    t = np.asarray(t)
-    y = np.asarray(y)
-    mask = (t >= tmin) & (t <= tmax)
-    idx_janela = np.where(mask)[0]
-    if len(idx_janela) < 3:
-        if len(idx_janela) == 0:
-            return float(tmin), float(y[int(np.searchsorted(t, tmin))])
-        melhor = idx_janela[np.argmax(y[idx_janela])]
-        return float(t[melhor]), float(y[melhor])
-
-    y_janela = y[idx_janela]
-    picos, _ = find_peaks(y_janela)
-    if len(picos) == 0:
-        melhor = idx_janela[np.argmax(y_janela)]
-    else:
-        melhor = idx_janela[picos[np.argmax(y_janela[picos])]]
-    return float(t[melhor]), float(y[melhor])
-
-
 def maior_valor_no_intervalo(t, y, tmin, tmax):
     """Maior valor bruto do sinal resultante do acelerometro dentro de
     [tmin, tmax] -- usado para os picos de aceleracao das transicoes
-    (sentado->pe e pe->sentado), que ja ficam bem delimitados pela janela
-    (nao precisam do cuidado de "pico local" feito para G0)."""
+    (sentado->pe e pe->sentado)."""
     t = np.asarray(t)
     y = np.asarray(y)
     mask = (t >= tmin) & (t <= tmax)
@@ -131,22 +104,26 @@ def maior_valor_no_intervalo(t, y, tmin, tmax):
 
 def metricas_a_partir_de_sinais(sinais):
     """Recalcula o dicionario de metricas a partir dos valores guardados em
-    `sinais` (start_test, stop_test, G0/G1/G2, A1/A2). Nomes e ordem seguem
-    uma tabela de referencia publicada (fases do TUG + picos de aceleracao e
+    `sinais` (start_test, stop_test, G1/G2, A1/A2). Nomes e ordem seguem uma
+    tabela de referencia publicada (fases do TUG + picos de aceleracao e
     velocidade angular). Serve tanto para o calculo automatico quanto para
-    depois de uma correcao manual de qualquer um desses instantes."""
+    depois de uma correcao manual de qualquer um desses instantes.
+
+    Sem marco G0 separado: o pico de aceleracao A1 (o mais alto da resultante
+    do acelerometro entre o inicio e o giro G1) marca o fim da transicao
+    sentado->pe -- e o proprio instante do "empurrao" para levantar, entao
+    serve como fronteira entre a fase sentado->pe e a caminhada de ida."""
     start_test = sinais["start_test"]
     stop_test = sinais["stop_test"]
-    G0_lat = sinais["G0_lat"]
     G1_lat, G1_amp = sinais["G1_lat"], sinais["G1_amp"]
     G2_lat, G2_amp = sinais["G2_lat"], sinais["G2_amp"]
-    A1_amp = sinais["A1_amp"]
+    A1_lat, A1_amp = sinais["A1_lat"], sinais["A1_amp"]
     A2_amp = sinais["A2_amp"]
 
     return {
         "Total duration (s)": round(stop_test - start_test, 4),
-        "Sit-to-Stand transition duration (s)": round(G0_lat - start_test, 4),
-        "Forward walking duration (s)": round(G1_lat - G0_lat, 4),
+        "Sit-to-Stand transition duration (s)": round(A1_lat - start_test, 4),
+        "Forward walking duration (s)": round(G1_lat - A1_lat, 4),
         "Return walking duration (s)": round(G2_lat - G1_lat, 4),
         "Stand-to-Sit transition duration (s)": round(stop_test - G2_lat, 4),
         "Peak acceleration during Sit-to-Stand duration (m/s²)": round(A1_amp, 4),
@@ -167,10 +144,12 @@ def processar_paciente_tug(dados_acc, dados_gyro, baseline_onset, baseline_offse
         (inicio/fim do teste e localizacao dos picos) -- podem ser corrigidos
         manualmente depois, se necessario.
 
-    Todos os marcos (inicio, fim, G0, G1, G2, e os picos de aceleracao A1/A2)
-    sao detectados nos sinais RESULTANTES (norma_gyro_filtrado / norma_acc_filtrado)
+    Todos os marcos (inicio, fim, G1, G2, e os picos de aceleracao A1/A2) sao
+    detectados nos sinais RESULTANTES (norma_gyro_filtrado / norma_acc_filtrado)
     devolvidos por tugProcessing.processar_tug -- o mesmo sinal mostrado nos
-    graficos de conferencia.
+    graficos de conferencia. A1 e o maior valor da resultante do acelerometro
+    entre o inicio e G1 (cobre toda a fase sentado->pe + caminhada de ida, ate
+    o primeiro giro); A2 e o maior valor entre G2 e o fim.
     """
     (t_novo_acc, v_acc, ml_acc, z_acc_filtrado, norma_acc_filtrado,
      t_novo_gyro, v_gyro, ml_gyro, z_gyro_filtrado, norma_gyro_filtrado,
@@ -185,11 +164,8 @@ def processar_paciente_tug(dados_acc, dados_gyro, baseline_onset, baseline_offse
     G1_lat, G1_amp, G2_lat, G2_amp = detectar_dois_maiores_picos(
         t_novo_gyro, norma_gyro_filtrado, start_test, stop_test
     )
-    G0_lat, G0_amp = detectar_maior_pico_local(
-        t_novo_gyro, norma_gyro_filtrado, start_test, G1_lat
-    )
     A1_lat, A1_amp = maior_valor_no_intervalo(
-        t_novo_acc, norma_acc_filtrado, start_test, G0_lat
+        t_novo_acc, norma_acc_filtrado, start_test, G1_lat
     )
     A2_lat, A2_amp = maior_valor_no_intervalo(
         t_novo_acc, norma_acc_filtrado, G2_lat, stop_test
@@ -202,7 +178,6 @@ def processar_paciente_tug(dados_acc, dados_gyro, baseline_onset, baseline_offse
         "norma_gyro_filtrado": norma_gyro_filtrado,
         "start_test": start_test,
         "stop_test": stop_test,
-        "G0_lat": G0_lat, "G0_amp": G0_amp,
         "G1_lat": G1_lat, "G1_amp": G1_amp,
         "G2_lat": G2_lat, "G2_amp": G2_amp,
         "A1_lat": A1_lat, "A1_amp": A1_amp,
@@ -214,14 +189,14 @@ def processar_paciente_tug(dados_acc, dados_gyro, baseline_onset, baseline_offse
 
 def recalcular_picos_acc(sinais):
     """Recalcula A1/A2 (picos de aceleracao resultante) a partir das janelas
-    [start_test, G0_lat] e [G2_lat, stop_test] em `sinais` -- chamar depois de
-    qualquer correcao manual de start/G0/G2/stop, para que os picos de
+    [start_test, G1_lat] e [G2_lat, stop_test] em `sinais` -- chamar depois de
+    qualquer correcao manual de start/G1/G2/stop, para que os picos de
     aceleracao acompanhem as novas janelas em vez de ficarem com o valor
     antigo."""
     sinais = dict(sinais)
     A1_lat, A1_amp = maior_valor_no_intervalo(
         sinais["t_novo_acc"], sinais["norma_acc_filtrado"],
-        sinais["start_test"], sinais["G0_lat"],
+        sinais["start_test"], sinais["G1_lat"],
     )
     A2_lat, A2_amp = maior_valor_no_intervalo(
         sinais["t_novo_acc"], sinais["norma_acc_filtrado"],
